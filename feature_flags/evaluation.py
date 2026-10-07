@@ -6,9 +6,19 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 
 from .models import FlagSetConfig
+
+
+def _bucket(flag: str, dimension_value: str) -> int:
+    """把 (开关名, 维度值) 稳定映射到 [0, 100) 的桶。
+
+    同一输入永远落在同一桶，与进程、机器无关（SHA-256 前 8 字节取模）。
+    """
+    digest = hashlib.sha256(f"{flag}:{dimension_value}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % 100
 
 
 @dataclass
@@ -40,4 +50,39 @@ class Evaluator:
 
     def evaluate(self, name: str, ctx: EvalContext) -> EvalResult:
         """求值单个开关；同一 ctx 内结果记忆化，保证请求内一致。"""
-        raise NotImplementedError
+        if name in ctx._memo:
+            return EvalResult(flag=name, enabled=ctx._memo[name], source="memo")
+        result = self._evaluate_uncached(name, ctx)
+        ctx._memo[name] = result.enabled
+        return result
+
+    def _evaluate_uncached(self, name: str, ctx: EvalContext) -> EvalResult:
+        flag = self._config.flags.get(name)
+        if flag is None:
+            return EvalResult(flag=name, enabled=False, source="unknown_flag")
+
+        # 1. 强制关闭：最高优先级，任何覆盖都不能打开。
+        if flag.force_off:
+            return EvalResult(flag=name, enabled=False, source="force_off")
+
+        # 2. 定向覆盖：最细粒度，优先于灰度规则。
+        for override in flag.overrides:
+            value = ctx.dimensions.get(override.dimension)
+            if value is not None and value in override.values:
+                return EvalResult(flag=name, enabled=override.enabled, source="override")
+
+        # 3. 维度规则（名单灰度）。
+        for rule in flag.rules:
+            value = ctx.dimensions.get(rule.dimension)
+            if value is not None and value in rule.values:
+                return EvalResult(flag=name, enabled=rule.enabled, source="rule")
+
+        # 4. 百分比灰度：bucket < percentage 即命中。
+        #    percentage=0 时永不命中；percentage=100 时恒命中（桶域为 [0,100)）。
+        if flag.rollout is not None:
+            value = ctx.dimensions.get(flag.rollout.dimension)
+            if value is not None and _bucket(name, value) < flag.rollout.percentage:
+                return EvalResult(flag=name, enabled=True, source="rollout")
+
+        # 5. 默认值兜底。
+        return EvalResult(flag=name, enabled=flag.default, source="default")
